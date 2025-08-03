@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    ports:
+      - '5432:5432'
+    environment:
+      - POSTGRES_DB=openwebui
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=securepassword123
+    volumes:
+      - ./volumes/postgres/data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d openwebui']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - local-ai-network
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    ports:
+      - '5050:80'
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@local.ai
+      - PGADMIN_DEFAULT_PASSWORD=admin123
+      - PGADMIN_CONFIG_SERVER_MODE=False
+      - PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED=False
+    volumes:
+      - ./volumes/pgadmin:/var/lib/pgadmin
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - local-ai-network
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: webui
+    ports:
+      - '3000:8080'
+    volumes:
+      - ./volumes/open-webui/data:/app/backend/data
+    environment:
+      # Ollama connection
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+
+      # Database connection
+      - DATABASE_URL=postgresql://postgres:securepassword123@postgres:5432/openwebui
+
+      # Basic settings
+      - WEBUI_SECRET_KEY=your-secret-key-here
+      - WEBUI_AUTH=true
+      - ENABLE_SIGNUP=true
+      - DEFAULT_MODELS=qwen3:8b
+
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - local-ai-network
+
+networks:
+  local-ai-network:
+    driver: bridge
