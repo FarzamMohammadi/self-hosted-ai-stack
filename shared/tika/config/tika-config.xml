@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<properties>
+  <!-- Basic PDF Parser with OCR -->
+  <parser class="org.apache.tika.parser.pdf.PDFParser">
+    <params>
+      <param name="extractInlineImages">true</param>
+      <param name="sortByPosition">true</param>
+      <param name="enableAutoSpace">true</param>
+      <param name="ocrStrategy">OCR_AND_TEXT_EXTRACTION</param>
+      <param name="ocrDPI">300</param>
+    </params>
+  </parser>
+  
+  <!-- Basic OCR for images -->
+  <parser class="org.apache.tika.parser.ocr.TesseractOCRParser">
+    <params>
+      <param name="language">eng</param>
+      <param name="timeout">300</param>
+      <param name="tesseractPath">/usr/bin/tesseract</param>
+    </params>
+  </parser>
+  
+  <!-- Resource limits to prevent excessive usage -->
+  <resource-limits>
+    <limit name="MaxStringLength">10000000</limit>
+    <limit name="MaxExtractLength">10000000</limit>
+    <limit name="MaxParseTime">300000</limit>
+  </resource-limits>
+</properties>
