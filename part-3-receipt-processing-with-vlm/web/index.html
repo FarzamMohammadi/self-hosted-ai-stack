@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload Receipt - Receipt Manager</title>
+    <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+    <header class="header">
+        <div class="header-content">
+            <h1><a href="/index.html" class="header-link">Receipt Manager</a></h1>
+            <nav class="nav">
+                <a href="/receipts.html" class="btn btn-secondary">View Receipts</a>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <div class="card">
+            <div class="card-header">
+                <h2 class="card-title">Upload Receipt</h2>
+            </div>
+            <div class="card-body">
+                <!-- Alert Messages -->
+                <div id="alertContainer" role="alert" aria-live="polite"></div>
+
+                <!-- Upload Zone -->
+                <div id="uploadZone" class="upload-zone"
+                     role="button"
+                     tabindex="0"
+                     aria-label="Upload receipt. Drag and drop or click to browse.">
+                    <div class="upload-icon">&#128196;</div>
+                    <p class="upload-text">Drag and drop receipt here</p>
+                    <p class="upload-hint">or click to browse</p>
+                    <p class="upload-hint section-spacing">Supported: JPG, PNG, PDF (Max 10MB)</p>
+                    <input type="file" id="fileInput" accept=".jpg,.jpeg,.png,.pdf" style="display: none;">
+                </div>
+
+                <!-- Upload Progress -->
+                <div id="uploadProgress" class="hidden">
+                    <p class="text-center" style="margin-bottom: 0.5rem;">
+                        <strong>Uploading...</strong>
+                    </p>
+                    <div class="progress" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                        <div id="progressBar" class="progress-bar" style="width: 0%"></div>
+                    </div>
+                    <p class="text-center text-sm" style="margin-top: 0.5rem; color: var(--text-secondary);">
+                        <span id="progressText">0%</span>
+                    </p>
+                </div>
+
+                <!-- Upload Result -->
+                <div id="uploadResult" class="hidden">
+                    <div class="receipt-metadata">
+                        <h3 style="margin-bottom: 1rem;">Receipt Uploaded Successfully</h3>
+                        <div class="metadata-row">
+                            <span class="metadata-label">Filename:</span>
+                            <span class="metadata-value" id="receiptFilename">-</span>
+                        </div>
+                        <div class="metadata-row">
+                            <span class="metadata-label">Status:</span>
+                            <span class="metadata-value">
+                                <span class="status-badge status-pending">Pending</span>
+                            </span>
+                        </div>
+                        <div class="metadata-row">
+                            <span class="metadata-label">Processing:</span>
+                            <span class="metadata-value" id="processingStatus">Queued for processing</span>
+                        </div>
+                    </div>
+
+                    <div style="display: flex; gap: 1rem; justify-content: center; margin-top: 1.5rem;">
+                        <button id="uploadAnotherBtn" class="btn btn-secondary">Upload Another</button>
+                        <a href="/receipts.html" class="btn btn-primary">View All Receipts</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Instructions Card -->
+        <div class="card">
+            <div class="card-header">
+                <h3 class="card-title">How It Works</h3>
+            </div>
+            <div class="card-body">
+                <ol class="instructions-list">
+                    <li><strong>Upload</strong> - Drop your receipt image or PDF</li>
+                    <li><strong>Process</strong> - AI extracts item-level data automatically</li>
+                    <li><strong>Review</strong> - View extracted items with confidence scores</li>
+                    <li><strong>Export</strong> - Download data as CSV for your records</li>
+                </ol>
+            </div>
+        </div>
+    </main>
+
+    <script src="/js/app.js"></script>
+    <script src="/js/upload.js"></script>
+</body>
+</html>

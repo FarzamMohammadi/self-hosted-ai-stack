@@ -1,0 +1,199 @@
+{
+  "name": "Receipt Detail Provider",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "get-receipt-detail",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "get-receipt-detail-webhook",
+      "name": "Get Receipt Detail Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Validate Receipt ID\n * Ensures the receipt_id query parameter exists and is a valid UUID v4 format.\n */\nconst query = $input.first().json.query || {};\nconst receiptId = query.receipt_id;\n\n// Require receipt_id parameter\nif (!receiptId) {\n  throw new Error('Missing required parameter: receipt_id');\n}\n\n// UUID v4 format: 8-4-4-4-12 hexadecimal characters (case-insensitive)\nconst UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;\nif (!UUID_PATTERN.test(receiptId)) {\n  throw new Error('Invalid receipt_id format. Expected UUID.');\n}\n\nreturn [{\n  json: {\n    receiptId: receiptId\n  }\n}];"
+      },
+      "id": "validate-receipt-id",
+      "name": "Validate Receipt ID",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 300],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=SELECT id, filename, file_path, file_size, mime_type, file_hash, items, items_count, total_confidence_score, processing_status, currency, receipt_type, tax_format, receipt_subtotal, receipt_total_tax_amount, receipt_total_tax_percentage, receipt_total, created_at, updated_at FROM receipts WHERE id = '{{ $json.receiptId }}'"
+      },
+      "id": "fetch-receipt",
+      "name": "Fetch Receipt",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [680, 300],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Format Receipt Response\n * Transforms raw database result into the API response format expected by the UI.\n * Handles flexible JSONB parsing since PostgreSQL may return items in different formats.\n */\n\n// --- Validate Database Result ---\nconst receipts = $input.all();\nif (!receipts || receipts.length === 0) {\n  throw new Error('Receipt not found');\n}\nconst receipt = receipts[0].json;\n\n// --- Parse JSONB Items Column ---\n// PostgreSQL JSONB can arrive as: array, JSON string, or pre-parsed object\n// depending on n8n's postgres node version and data shape\nlet items = [];\nif (receipt.items) {\n  try {\n    if (Array.isArray(receipt.items)) {\n      items = receipt.items;\n    } else if (typeof receipt.items === 'string') {\n      items = JSON.parse(receipt.items);\n    } else if (typeof receipt.items === 'object') {\n      items = receipt.items;\n    }\n  } catch (e) {\n    console.error('[Receipt Detail Provider] Failed to parse items JSONB:', e);\n    items = [];\n  }\n}\n\n// Ensure items is always an array for consistent API response\nif (!Array.isArray(items)) {\n  items = [];\n}\n\n// --- Build Response ---\nreturn [{\n  json: {\n    receipt: {\n      id: receipt.id,\n      filename: receipt.filename,\n      file_path: receipt.file_path,\n      file_size: receipt.file_size,\n      mime_type: receipt.mime_type,\n      file_hash: receipt.file_hash,\n      items_count: receipt.items_count || items.length,\n      total_confidence_score: receipt.total_confidence_score,\n      processing_status: receipt.processing_status,\n      currency: receipt.currency || 'USD',\n      receipt_type: receipt.receipt_type,\n      tax_format: receipt.tax_format,\n      receipt_subtotal: receipt.receipt_subtotal,\n      receipt_total_tax_amount: receipt.receipt_total_tax_amount,\n      receipt_total_tax_percentage: receipt.receipt_total_tax_percentage,\n      receipt_total: receipt.receipt_total,\n      created_at: receipt.created_at,\n      updated_at: receipt.updated_at\n    },\n    items: items\n  }\n}];"
+      },
+      "id": "parse-and-format-response",
+      "name": "Parse and Format Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 300],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "responseCode": 200,
+        "responseHeaders": {
+          "entries": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "id": "success-response",
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Prepare Error Response\n * Maps error messages to appropriate HTTP status codes.\n * Status codes: 400 (bad request), 404 (not found), 500 (server error)\n */\nconst error = $input.first();\n\n// Default error response\nlet errorMessage = 'Failed to fetch receipt details';\nlet statusCode = 500;\n\n// Determine appropriate status code based on error message\nif (error && error.json) {\n  const errMsg = error.json.error || error.json.message || '';\n  \n  if (errMsg.includes('Missing required parameter') || errMsg.includes('Invalid receipt_id format')) {\n    statusCode = 400;  // Bad Request - client sent invalid input\n    errorMessage = errMsg;\n  } else if (errMsg.includes('not found')) {\n    statusCode = 404;  // Not Found - receipt doesn't exist\n    errorMessage = 'Receipt not found';\n  } else {\n    errorMessage = errMsg || errorMessage;\n  }\n}\n\nconsole.error('[Receipt Detail Provider] Error:', errorMessage);\n\nreturn [{\n  json: {\n    status: 'error',\n    message: errorMessage,\n    statusCode: statusCode\n  }\n}];"
+      },
+      "id": "prepare-error-response",
+      "name": "Prepare Error Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: $json.status, message: $json.message } }}",
+        "responseCode": "={{ $json.statusCode }}",
+        "responseHeaders": {
+          "entries": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "id": "error-response",
+      "name": "Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [900, 500]
+    }
+  ],
+  "connections": {
+    "Get Receipt Detail Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Receipt ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Receipt ID": {
+      "main": [
+        [
+          {
+            "node": "Fetch Receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Prepare Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Receipt": {
+      "main": [
+        [
+          {
+            "node": "Parse and Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Prepare Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse and Format Response": {
+      "main": [
+        [
+          {
+            "node": "Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Prepare Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Error Response": {
+      "main": [
+        [
+          {
+            "node": "Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1"
+}

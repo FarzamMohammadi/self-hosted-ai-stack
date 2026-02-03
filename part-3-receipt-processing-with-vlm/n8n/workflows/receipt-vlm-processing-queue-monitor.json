@@ -1,0 +1,335 @@
+{
+  "name": "Receipt VLM Processing Queue Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "queue-monitor-trigger",
+      "name": "Queue Monitor Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, receipt_id, created_at, retry_count, max_retries, vlm_model_used FROM receipt_processing_jobs WHERE (status = 'pending' OR (status = 'failed' AND retry_count < max_retries)) AND (SELECT COUNT(*) FROM receipt_processing_jobs WHERE status = 'running') < 3 ORDER BY priority ASC, created_at ASC LIMIT 1"
+      },
+      "id": "fetch-pending-jobs",
+      "name": "Fetch Pending Jobs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Prepare Job\n * Validates that a job was found and prepares job metadata for processing.\n * Determines if this is a retry attempt based on retry_count.\n *\n * Queue Selection Logic (from SQL):\n * - Selects jobs with status='pending' OR (status='failed' AND retries remaining)\n * - Limits to 3 concurrent running jobs (MAX_CONCURRENT_JOBS)\n * - Orders by priority (lower=higher) then by creation time (FIFO)\n */\n\n// --- Note: vlmModel comes from job.vlm_model_used or env var via processor ---\n\n// --- Validate Job Exists ---\nconst jobs = $input.all();\nif (!jobs || jobs.length === 0) {\n  // No jobs available - return empty to stop workflow gracefully\n  return [];\n}\n\n// --- Prepare Job Data ---\nconst job = jobs[0].json;\nconst isRetry = job.retry_count > 0;\n\nreturn [{\n  json: {\n    jobId: job.id,\n    receiptId: job.receipt_id,\n    createdAt: job.created_at,\n    retryCount: job.retry_count,\n    maxRetries: job.max_retries,\n    isRetry: isRetry,\n    processingTime: new Date().toISOString(),\n    vlmModel: job.vlm_model_used\n  }\n}];"
+      },
+      "id": "prepare-job",
+      "name": "Prepare Job",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE receipt_processing_jobs SET status = 'running', started_at = NOW(), worker_id = 'n8n-queue-monitor' WHERE id = '{{ $json.jobId }}' AND (status = 'pending' OR (status = 'failed' AND retry_count < max_retries))"
+      },
+      "id": "mark-job-running",
+      "name": "Mark Job Running",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [900, 300],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE receipts SET processing_status = 'processing', updated_at = NOW() WHERE id = '{{ $node['Prepare Job'].json.receiptId }}'"
+      },
+      "id": "update-receipt-status",
+      "name": "Update Receipt Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [1120, 300],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "http://localhost:5678/webhook/process-receipt-vlm",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "jobId",
+              "value": "={{ $node['Prepare Job'].json.jobId }}"
+            },
+            {
+              "name": "receiptId",
+              "value": "={{ $node['Prepare Job'].json.receiptId }}"
+            },
+            {
+              "name": "vlmModel",
+              "value": "={{ $node['Prepare Job'].json.vlmModel }}"
+            },
+            {
+              "name": "triggeredBy",
+              "value": "queue-monitor"
+            },
+            {
+              "name": "processingTime",
+              "value": "={{ $node['Prepare Job'].json.processingTime }}"
+            },
+            {
+              "name": "isRetry",
+              "value": "={{ $node['Prepare Job'].json.isRetry }}"
+            },
+            {
+              "name": "retryCount",
+              "value": "={{ $node['Prepare Job'].json.retryCount }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 900000
+        }
+      },
+      "id": "trigger-vlm-processor",
+      "name": "Trigger VLM Processor",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 300],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "success",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-processing-response",
+      "name": "Check Processing Response",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Log Success\n * Records successful VLM processing with extraction metrics.\n * Includes retry information for monitoring retry effectiveness.\n */\nconst result = $input.first().json;\nconst timestamp = new Date().toISOString();\nconst jobInfo = $node['Prepare Job'].json;\n\nconsole.log(`[Queue Monitor] Processing succeeded:`, {\n  timestamp,\n  jobId: result.jobId,\n  receiptId: result.receiptId,\n  itemsExtracted: result.itemsExtracted,\n  totalConfidence: result.totalConfidence,\n  model: result.model,\n  isRetry: jobInfo.isRetry,\n  retryCount: jobInfo.retryCount\n});\n\nreturn [{ \n  json: { \n    processed: true, \n    timestamp, \n    result: result\n  } \n}];"
+      },
+      "id": "log-success",
+      "name": "Log Success",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1780, 200]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE receipt_processing_jobs SET status = 'failed', completed_at = NOW(), error_message = '{{ ($json.error || $json.message || \"HTTP \" + $json.status_code + \" response\").replace(/'/g, \"''\") }}', retry_count = retry_count + 1 WHERE id = '{{ $node['Prepare Job'].json.jobId }}'; UPDATE receipts SET processing_status = 'failed', updated_at = NOW() WHERE id = '{{ $node['Prepare Job'].json.receiptId }}'"
+      },
+      "id": "mark-job-failed",
+      "name": "Mark Job Failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [1780, 400],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Log Failure\n * Records VLM processing failure with error details.\n * Tracks retry status for monitoring automatic recovery.\n */\nconst result = $input.first().json;\nconst timestamp = new Date().toISOString();\nconst jobInfo = $node['Prepare Job'].json;\n\nconsole.error(`[Queue Monitor] Processing failed:`, {\n  timestamp,\n  statusCode: result.status_code,\n  error: result?.error || result?.message || 'Unknown error',\n  jobId: result?.jobId || jobInfo.jobId,\n  receiptId: result?.receiptId || jobInfo.receiptId,\n  isRetry: jobInfo.isRetry,\n  retryCount: jobInfo.retryCount,\n  maxRetries: jobInfo.maxRetries,\n  retriesRemaining: jobInfo.maxRetries - jobInfo.retryCount - 1\n});\n\nreturn [{ \n  json: { \n    error: true, \n    timestamp, \n    message: 'Receipt processing failed',\n    statusCode: result.status_code,\n    details: result\n  } \n}];"
+      },
+      "id": "log-failure",
+      "name": "Log Failure",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2000, 400]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Error Handler\n * Catches and logs errors from any node in the workflow.\n * These are infrastructure errors (DB failures, network issues), not VLM processing failures.\n */\nconst error = $input.first();\nconst timestamp = new Date().toISOString();\n\nconsole.error(`[Queue Monitor] Infrastructure error:`, {\n  timestamp,\n  error: error.json?.error || error.message || 'Unknown error',\n  node: error.json?.node || 'Unknown node',\n  jobId: error.json?.jobId || 'Unknown'\n});\n\nreturn [{ \n  json: { \n    error: true, \n    timestamp, \n    message: 'Queue processing failed',\n    details: error.json || error.message \n  } \n}];"
+      },
+      "id": "error-handler",
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 500]
+    }
+  ],
+  "connections": {
+    "Queue Monitor Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Pending Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Pending Jobs": {
+      "main": [
+        [
+          {
+            "node": "Prepare Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Job": {
+      "main": [
+        [
+          {
+            "node": "Mark Job Running",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Job Running": {
+      "main": [
+        [
+          {
+            "node": "Update Receipt Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Receipt Status": {
+      "main": [
+        [
+          {
+            "node": "Trigger VLM Processor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger VLM Processor": {
+      "main": [
+        [
+          {
+            "node": "Check Processing Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Processing Response": {
+      "main": [
+        [
+          {
+            "node": "Log Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Job Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Job Failed": {
+      "main": [
+        [
+          {
+            "node": "Log Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1"
+}

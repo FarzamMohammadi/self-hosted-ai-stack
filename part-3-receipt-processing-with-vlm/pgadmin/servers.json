@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Receipt Manager PostgreSQL",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "receipt_manager",
+      "Username": "receipt_user",
+      "SSLMode": "prefer",
+      "PassFile": "/tmp/pgpass"
+    }
+  }
+}

@@ -1,0 +1,210 @@
+{
+  "name": "Receipt List Provider",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "get-receipts",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "get-receipts-webhook",
+      "name": "Get Receipts Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Parse Query Parameters\n * Extracts and validates filter parameters from the request query string.\n */\n\n// --- Configuration Constants ---\nconst VALID_STATUSES = ['pending', 'processing', 'completed', 'failed'];\nconst DEFAULT_LIMIT = 1000;\nconst MAX_LIMIT = 10000;\nconst MAX_OFFSET = 100000;\n\n// --- Extract Query Parameters ---\nconst query = $input.first().json.query || {};\n\n// Status filter - validate against whitelist\nconst status = query.status || '';\nif (status && !VALID_STATUSES.includes(status)) {\n  throw new Error(`Invalid status filter. Allowed values: ${VALID_STATUSES.join(', ')}`);\n}\n\n// Date range filters\nconst dateFrom = query.date_from || '';\nconst dateTo = query.date_to || '';\n\n// Search filter (for filename search)\nconst search = query.search || '';\n\n// Pagination - constrained to reasonable bounds\nconst limit = Math.min(Math.max(parseInt(query.limit) || DEFAULT_LIMIT, 1), MAX_LIMIT);\nconst offset = Math.min(Math.max(parseInt(query.offset) || 0, 0), MAX_OFFSET);\n\nreturn [{\n  json: {\n    filters: {\n      status: status,\n      dateFrom: dateFrom,\n      dateTo: dateTo,\n      search: search,\n      limit: limit,\n      offset: offset\n    },\n    hasFilters: !!(status || dateFrom || dateTo || search)\n  }\n}];"
+      },
+      "id": "parse-query-params",
+      "name": "Parse Query Params",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 300],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Build SQL Query\n * Dynamically constructs a SELECT query with WHERE clauses based on filters.\n * Note: Status is pre-validated via whitelist in the previous node.\n */\nconst filters = $json.filters;\n\n// --- Sanitization Helper ---\n// Escape single quotes and limit length to prevent SQL issues\nconst sanitizeString = (str, maxLength = 255) => {\n  if (typeof str !== 'string') return '';\n  return str.replace(/'/g, \"''\").substring(0, maxLength);\n};\n\n// --- Base Query ---\nlet query = `\n  SELECT \n    id,\n    filename,\n    file_path,\n    file_size,\n    mime_type,\n    file_hash,\n    items_count,\n    total_confidence_score,\n    processing_status,\n    currency,\n    receipt_type,\n    receipt_total,\n    created_at,\n    updated_at\n  FROM receipts\n`;\n\n// --- Build WHERE Clauses ---\nconst whereClauses = [];\n\n// Status filter (already validated against whitelist)\nif (filters.status) {\n  whereClauses.push(`processing_status = '${filters.status}'`);\n}\n\n// Date range filters (cast to timestamp for proper comparison)\nif (filters.dateFrom) {\n  whereClauses.push(`created_at >= '${sanitizeString(filters.dateFrom)}'::timestamp`);\n}\nif (filters.dateTo) {\n  whereClauses.push(`created_at <= '${sanitizeString(filters.dateTo)}'::timestamp`);\n}\n\n// Filename search (case-insensitive partial match)\nif (filters.search) {\n  const escapedSearch = sanitizeString(filters.search);\n  whereClauses.push(`filename ILIKE '%${escapedSearch}%'`);\n}\n\n// Combine WHERE clauses with AND\nif (whereClauses.length > 0) {\n  query += ' WHERE ' + whereClauses.join(' AND ');\n}\n\n// --- Ordering and Pagination ---\nquery += ' ORDER BY created_at DESC';\nquery += ` LIMIT ${filters.limit} OFFSET ${filters.offset}`;\n\nreturn [{\n  json: {\n    sqlQuery: query,\n    filters: filters\n  }\n}];"
+      },
+      "id": "build-sql-query",
+      "name": "Build SQL Query",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sqlQuery }}"
+      },
+      "id": "fetch-receipts",
+      "name": "Fetch Receipts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [900, 300],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Format Response\n * Transforms database results into the API response format.\n * Returns an array of receipt objects (UI expects this format).\n */\nconst inputItems = $input.all();\n\n// Handle empty results - return empty array\nif (!inputItems || inputItems.length === 0) {\n  return [{ json: [] }];\n}\n\n// Map database rows to response format\nconst receipts = inputItems.map(item => item.json);\n\nreturn [{ json: receipts }];"
+      },
+      "id": "format-response",
+      "name": "Format Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "responseCode": 200,
+        "responseHeaders": {
+          "entries": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "id": "success-response",
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Prepare Error Response\n * Formats error information for the API response.\n * Always returns an empty receipts array for consistency.\n */\nconst error = $input.first();\n\nlet errorMessage = 'Failed to fetch receipts';\nlet statusCode = 500;\n\nif (error && error.json) {\n  const errMsg = error.json.error || error.json.message || '';\n  \n  // Check for validation errors (return 400 Bad Request)\n  if (errMsg.includes('Invalid status filter')) {\n    statusCode = 400;\n    errorMessage = errMsg;\n  } else {\n    errorMessage = errMsg || errorMessage;\n  }\n}\n\nconsole.error('[Receipt List Provider] Error:', errorMessage);\n\nreturn [{\n  json: {\n    status: 'error',\n    message: errorMessage,\n    statusCode: statusCode,\n    receipts: []\n  }\n}];"
+      },
+      "id": "prepare-error-response",
+      "name": "Prepare Error Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: $json.status, message: $json.message, receipts: $json.receipts } }}",
+        "responseCode": "={{ $json.statusCode || 500 }}",
+        "responseHeaders": {
+          "entries": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "id": "error-response",
+      "name": "Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1120, 500]
+    }
+  ],
+  "connections": {
+    "Get Receipts Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse Query Params",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Query Params": {
+      "main": [
+        [
+          {
+            "node": "Build SQL Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Prepare Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build SQL Query": {
+      "main": [
+        [
+          {
+            "node": "Fetch Receipts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Receipts": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Prepare Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [
+          {
+            "node": "Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Error Response": {
+      "main": [
+        [
+          {
+            "node": "Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1"
+}

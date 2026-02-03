@@ -1,0 +1,293 @@
+{
+  "name": "Receipt Upload & Job Creation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "upload-receipt",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*",
+          "rawBody": true
+        },
+        "onError": "continueRegularOutput"
+      },
+      "id": "upload-receipt-webhook",
+      "name": "Upload Receipt Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Validate Upload\n * Validates uploaded file: checks for presence, supported type, and size limits.\n * Parses file size from various formats (string with units or raw number).\n */\n\n// --- Configuration Constants ---\nconst MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;  // 10MB\nconst MAX_FILE_SIZE_MB = 10;\nconst SUPPORTED_MIME_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];\n\n// --- Validate File Presence ---\nconst inputData = $input.first();\nif (!inputData.binary || !inputData.binary.data) {\n  throw new Error('No file uploaded');\n}\n\nconst fileData = inputData.binary.data;\nif (!fileData.fileName || !fileData.mimeType) {\n  throw new Error('Invalid file data');\n}\n\n// --- Parse File Size ---\n// n8n may report fileSize as string with units (e.g., '9.86 kB') or as raw number\nlet fileSizeBytes;\nif (fileData.fileSize) {\n  if (typeof fileData.fileSize === 'string') {\n    // Parse string format: \"9.86 kB\", \"1.5 MB\", etc.\n    const match = fileData.fileSize.match(/([0-9.]+)\\s*(kB|MB|GB|B)?/i);\n    if (match) {\n      const num = parseFloat(match[1]);\n      const unit = (match[2] || 'B').toUpperCase();\n      const multipliers = { 'B': 1, 'KB': 1024, 'MB': 1024*1024, 'GB': 1024*1024*1024 };\n      fileSizeBytes = Math.round(num * (multipliers[unit] || 1));\n    } else {\n      throw new Error('Invalid file size format');\n    }\n  } else {\n    fileSizeBytes = parseInt(fileData.fileSize);\n  }\n} else if (fileData.data) {\n  // Fallback: estimate from base64 length (base64 is ~4/3 the size of binary)\n  fileSizeBytes = Math.round((fileData.data.length * 3) / 4);\n} else {\n  throw new Error('Cannot determine file size');\n}\n\n// --- Validate MIME Type ---\nif (!SUPPORTED_MIME_TYPES.includes(fileData.mimeType.toLowerCase())) {\n  throw new Error(`Unsupported file type: ${fileData.mimeType}. Supported: ${SUPPORTED_MIME_TYPES.join(', ')}`);\n}\n\n// --- Validate File Size ---\nif (fileSizeBytes > MAX_FILE_SIZE_BYTES) {\n  throw new Error(`File too large: ${Math.round(fileSizeBytes / 1024 / 1024)}MB. Max: ${MAX_FILE_SIZE_MB}MB`);\n}\n\nreturn [{\n  json: {\n    filename: fileData.fileName,\n    mime_type: fileData.mimeType,\n    file_size: fileSizeBytes,\n    upload_timestamp: new Date().toISOString()\n  },\n  binary: inputData.binary\n}];"
+      },
+      "id": "validate-upload",
+      "name": "Validate Upload",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 300],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Prepare File Metadata\n * Generates unique identifiers and builds the storage path for the uploaded file.\n * Creates a date-based directory structure (YYYY/MM/DD) for organized storage.\n */\n\n// --- Configuration Constants ---\nconst UPLOAD_BASE_PATH = '/app/uploads/receipts';\nconst PUBLIC_URL_BASE = '/uploads/receipts';\n\n// --- Validate Input ---\nconst inputItem = $input.first();\nconst inputData = inputItem.json;\nconst binaryData = inputItem.binary;\n\nif (!binaryData || !binaryData.data) {\n  throw new Error('Binary data missing');\n}\n\n// --- Generate UUID v4 ---\n// RFC 4122 compliant: version 4 (random) with proper variant bits\n// Format: 8-4-4-4-12 hex chars, with version=4 and variant=10xx\nconst uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {\n  const r = Math.random() * 16 | 0;\n  return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);\n});\n\n// --- Generate File Hash ---\n// djb2 hash variant for deduplication identification (NOT cryptographically secure)\n// Used to detect duplicate uploads within the system, not for security purposes\nconst generateHash = (str) => {\n  let hash = 5381;  // djb2 magic constant\n  for (let i = 0; i < str.length; i++) {\n    hash = ((hash << 5) + hash) + str.charCodeAt(i);  // hash * 33 + char\n    hash = hash >>> 0;  // Convert to unsigned 32-bit\n  }\n  return hash.toString(16).padStart(8, '0');\n};\n\n// --- Build Date-Based Path ---\nconst now = new Date();\nconst year = now.getFullYear();\nconst month = String(now.getMonth() + 1).padStart(2, '0');\nconst day = String(now.getDate()).padStart(2, '0');\n\n// Sanitize filename: keep only alphanumeric, dots, hyphens, underscores\nconst safeFileName = inputData.filename.replace(/[^a-zA-Z0-9._-]/g, '_');\nconst fileNameWithUUID = `${uuid}-${safeFileName}`;\n\n// Full storage path and public URL\nconst filePath = `${UPLOAD_BASE_PATH}/${year}/${month}/${day}/${fileNameWithUUID}`;\nconst publicUrl = `${PUBLIC_URL_BASE}/${year}/${month}/${day}/${fileNameWithUUID}`;\n\n// Hash combines UUID + filename + timestamp for uniqueness\nconst fileHash = generateHash(uuid + inputData.filename + inputData.upload_timestamp);\n\nreturn [{\n  json: {\n    receipt_id: uuid,\n    filename: inputData.filename,\n    file_path: filePath,\n    public_url: publicUrl,\n    file_hash: fileHash,\n    file_size: inputData.file_size,\n    mime_type: inputData.mime_type,\n    upload_timestamp: inputData.upload_timestamp,\n    year,\n    month,\n    day\n  },\n  binary: binaryData\n}];"
+      },
+      "id": "prepare-file-metadata",
+      "name": "Prepare File Metadata",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "command": "={{ 'mkdir -p /app/uploads/receipts/' + $json.year + '/' + $json.month + '/' + $json.day }}"
+      },
+      "id": "create-upload-directory",
+      "name": "Create Upload Directory",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1020, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "/**\n * Re-attach Binary Data\n * The executeCommand node strips binary data from the workflow.\n * This node restores it from the earlier Prepare File Metadata node.\n */\nconst prepareData = $('Prepare File Metadata').first();\nreturn [{ json: prepareData.json, binary: prepareData.binary }];"
+      },
+      "id": "reattach-binary-data",
+      "name": "Re-attach Binary Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1140, 300]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ $json.file_path }}",
+        "dataPropertyName": "data"
+      },
+      "id": "save-file-to-disk",
+      "name": "Save File to Disk",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [1260, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO receipts (id, filename, file_path, file_size, mime_type, file_hash, processing_status, created_at, updated_at) VALUES ('{{ $json.receipt_id }}', '{{ $json.filename }}', '{{ $json.file_path }}', {{ $json.file_size }}, '{{ $json.mime_type }}', '{{ $json.file_hash }}', 'pending', NOW(), NOW()) RETURNING id, filename, file_path, processing_status, created_at"
+      },
+      "id": "insert-receipt-record",
+      "name": "Insert Receipt Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [1560, 300],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO receipt_processing_jobs (receipt_id, status, priority, created_at) VALUES ('{{ $json.id }}', 'pending', 5, NOW()) RETURNING id, receipt_id, status, priority, created_at"
+      },
+      "id": "create-processing-job",
+      "name": "Create Processing Job",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [1780, 300],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Prepare Success Response\n * Assembles the API response after successful upload and job creation.\n * Includes receipt details and processing job information.\n */\nconst receipt = $node['Insert Receipt Record'].json;\nconst job = $input.first().json;\nconst metadata = $node['Prepare File Metadata'].json;\n\nreturn [{\n  json: {\n    status: 'success',\n    message: 'Receipt uploaded successfully and queued for processing',\n    receipt: {\n      filename: receipt.filename,\n      publicUrl: metadata.public_url,\n      processingStatus: receipt.processing_status,\n      uploadedAt: receipt.created_at\n    },\n    job: {\n      status: job.status,\n      priority: job.priority,\n      createdAt: job.created_at\n    }\n  }\n}];"
+      },
+      "id": "prepare-success-response",
+      "name": "Prepare Success Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2000, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "responseCode": 200
+      },
+      "id": "success-response",
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [2220, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Prepare Error Response\n * Formats error information for the API response.\n * Extracts error message from various possible error object shapes.\n */\nconst error = $input.first().json;\nconst errorMsg = error?.error || error?.message || 'Unknown error occurred';\n\nconsole.error('[Receipt Upload] Error:', errorMsg);\n\nreturn [{\n  json: {\n    status: 'error',\n    message: 'Receipt upload failed',\n    error: errorMsg\n  }\n}];"
+      },
+      "id": "prepare-error-response",
+      "name": "Prepare Error Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "responseCode": 400
+      },
+      "id": "error-response",
+      "name": "Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1560, 500]
+    }
+  ],
+  "connections": {
+    "Upload Receipt Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Upload": {
+      "main": [
+        [
+          {
+            "node": "Prepare File Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare File Metadata": {
+      "main": [
+        [
+          {
+            "node": "Create Upload Directory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Upload Directory": {
+      "main": [
+        [
+          {
+            "node": "Re-attach Binary Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Re-attach Binary Data": {
+      "main": [
+        [
+          {
+            "node": "Save File to Disk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save File to Disk": {
+      "main": [
+        [
+          {
+            "node": "Insert Receipt Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Receipt Record": {
+      "main": [
+        [
+          {
+            "node": "Create Processing Job",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Processing Job": {
+      "main": [
+        [
+          {
+            "node": "Prepare Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Success Response": {
+      "main": [
+        [
+          {
+            "node": "Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Error Response": {
+      "main": [
+        [
+          {
+            "node": "Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1"
+}

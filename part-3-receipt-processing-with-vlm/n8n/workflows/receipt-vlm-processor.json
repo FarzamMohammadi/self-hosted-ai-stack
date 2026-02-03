@@ -1,0 +1,438 @@
+{
+  "name": "Receipt VLM Processing & Item Extraction",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "process-receipt-vlm",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*",
+          "rawBody": false
+        }
+      },
+      "id": "process-receipt-webhook",
+      "name": "Process Receipt Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "jobId",
+              "name": "jobId",
+              "value": "={{ $json.body?.jobId }}",
+              "type": "string"
+            },
+            {
+              "id": "receiptId",
+              "name": "receiptId",
+              "value": "={{ $json.body?.receiptId }}",
+              "type": "string"
+            },
+            {
+              "id": "vlmModel",
+              "name": "vlmModel",
+              "value": "={{ $json.body?.vlmModel }}",
+              "type": "string"
+            },
+            {
+              "id": "configuredVlmModel",
+              "name": "configuredVlmModel",
+              "value": "={{ $env.OLLAMA_VLM_MODEL }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "configure-vlm-model",
+      "name": "Configure VLM Model",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        350,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=SELECT rpj.id as job_id, rpj.receipt_id, rpj.vlm_model_used, rpj.extraction_metadata FROM receipt_processing_jobs rpj WHERE rpj.id = '{{ $json.jobId }}' AND rpj.status = 'running'"
+      },
+      "id": "fetch-job-info",
+      "name": "Fetch Job Info",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        580,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=SELECT id, filename, file_path, file_size, mime_type, processing_status, created_at, updated_at FROM receipts WHERE id = '{{ $json.receipt_id }}'"
+      },
+      "id": "fetch-receipt-info",
+      "name": "Fetch Receipt Info",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        800,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Validate Receipt Data\n * Validates job and receipt records from database, ensures file is processable.\n * Determines which VLM model to use (job-specific or configured default).\n */\n\n// --- Configuration Constants ---\nconst SUPPORTED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'webp'];\nconst DEFAULT_MIME_TYPE = 'image/jpeg';\n\n// --- Fetch Data from Previous Nodes ---\nconst job = $node['Fetch Job Info'].json;\nconst receipt = $node['Fetch Receipt Info'].json;\nconst config = $node['Configure VLM Model'].json;\n\n// --- Validate Job ---\nif (!job || !job.job_id) {\n  throw new Error('Job not found or not in running state');\n}\n\n// --- Validate Receipt ---\nif (!receipt || !receipt.id) {\n  throw new Error('Receipt not found in database');\n}\n\nconst filename = receipt.filename || 'receipt.jpg';\nconst filePath = receipt.file_path;\n\nif (!filePath) {\n  throw new Error('Receipt file path not found');\n}\n\n// --- Validate File Type ---\nconst fileExtension = filename.split('.').pop()?.toLowerCase() || 'jpg';\nif (!SUPPORTED_EXTENSIONS.includes(fileExtension)) {\n  throw new Error(`Unsupported file format: ${fileExtension}. Supported: ${SUPPORTED_EXTENSIONS.join(', ')}`);\n}\n\n// --- Determine VLM Model ---\n// Priority: job-specific model > configured default\nconst vlmModel = job.vlm_model_used || config.configuredVlmModel;\n\nreturn [{\n  json: {\n    jobId: job.job_id,\n    receiptId: receipt.id,\n    filename: filename,\n    filePath: filePath,\n    fileExtension: fileExtension,\n    fileSize: receipt.file_size || 0,\n    mimeType: receipt.mime_type || DEFAULT_MIME_TYPE,\n    vlmModel: vlmModel,\n    createdAt: receipt.created_at,\n    processingStarted: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "validate-receipt-data",
+      "name": "Validate Receipt Data",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "={{ $node['Validate Receipt Data'].json.filePath }}",
+        "options": {
+          "dataPropertyName": "receiptImage"
+        }
+      },
+      "id": "read-receipt-file",
+      "name": "Read Receipt File",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        1240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Encode to Base64\n * Converts the binary image file to base64 string for VLM API.\n * Ollama's vision API requires images as base64-encoded strings.\n */\n\n// --- Configuration ---\nconst MIN_VALID_BASE64_LENGTH = 100;  // Sanity check for valid image data\n\n// --- Get Previous Node Data ---\nconst receiptData = $node['Validate Receipt Data'].json;\n\n// --- Encode Binary to Base64 ---\n// Read binary data from the Read/Write Files node output\nconst binaryData = await this.helpers.getBinaryDataBuffer(0, 'receiptImage');\nconst base64Image = binaryData.toString('base64');\n\n// Validate encoding succeeded\nif (!base64Image || base64Image.length < MIN_VALID_BASE64_LENGTH) {\n  throw new Error('Failed to encode image to base64 or image is too small');\n}\n\n// Calculate size for logging/debugging\nconst base64SizeKB = Math.round(base64Image.length / 1024);\n\nreturn [{\n  json: {\n    ...receiptData,\n    base64Image: base64Image,\n    base64SizeKB: base64SizeKB,\n    encodingComplete: true\n  }\n}];"
+      },
+      "id": "encode-to-base64",
+      "name": "Encode to Base64",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Prepare VLM Prompt\n * Assembles the complete VLM request with system prompt and Ollama options.\n *\n * Prompt Structure (v9.0.0-multi-region-tax):\n * - Supports both US (tax added) and EU (tax inclusive) formats\n * - Systematic rules for tax pattern recognition\n * - Tested: 20/20 on US receipts, 20/20 on EU receipts\n *\n * Ollama Options optimized for structured extraction:\n * - Low temperature (0.1) for deterministic output\n * - Fixed seed (42) for reproducibility\n * - Large context window (32800) for complex receipts\n */\nconst receiptData = $json;\n\n// --- VLM System Prompt (v9.0.0-multi-region-tax) ---\nconst systemPrompt = `Extract items AND totals from this receipt image as JSON.\n\nOutput format:\n{\n  \"currency\": \"USD\",\n  \"receipt_type\": \"grocery|restaurant|retail|service|unknown\",\n  \"tax_format\": \"added|inclusive|none\",\n  \"receipt_subtotal\": 0.00,\n  \"receipt_total_tax_amount\": 0.00,\n  \"receipt_total_tax_percentage\": 0.00,\n  \"receipt_total\": 0.00,\n  \"items\": [\n    {\n      \"item_name\": \"Product Name\",\n      \"item_quantity\": 1,\n      \"item_unit_price\": 0.00,\n      \"item_base_price\": 0.00,\n      \"item_discount_amount\": null,\n      \"item_discount_percentage\": null,\n      \"item_tax_price\": null,\n      \"item_tax_percentage\": null,\n      \"item_total_price\": 0.00,\n      \"item_sequence\": 1,\n      \"item_type\": \"standard\",\n      \"confidence_score\": 0.95,\n      \"item_metadata\": {\n        \"quantity_format\": null,\n        \"is_weight_based\": false,\n        \"weight_unit\": null,\n        \"is_voided\": false,\n        \"original_text\": \"\"\n      }\n    }\n  ]\n}\n\nRules:\n\nTAX HANDLING - Identify the tax format first:\n\n1. TAX ADDED (US/Canada style):\n   - Look for separate Subtotal, Tax/Sales Tax, and Total lines\n   - Total = Subtotal + Tax\n   - tax_format = \"added\"\n   - Extract each value directly from the receipt\n\n2. TAX INCLUSIVE (EU/Swiss style):\n   - Look for Total with \"Incl. X% MwSt/VAT/TVA: amount\" shown separately\n   - The tax is already part of the total, not added on top\n   - tax_format = \"inclusive\"\n   - receipt_total = the total shown\n   - receipt_total_tax_amount = the included tax amount shown\n   - receipt_total_tax_percentage = the percentage shown\n   - receipt_subtotal = receipt_total - receipt_total_tax_amount\n\n3. NO TAX SHOWN:\n   - If no tax information is visible\n   - tax_format = \"none\"\n   - Set tax fields to null\n\nOTHER RULES:\n- Remove quantity prefixes (1x, 2x) from item_name, put in item_quantity\n- item_total_price = item_base_price - item_discount_amount (when discount exists)\n- Math: item_quantity \u00d7 item_unit_price = item_base_price\n- Return JSON only`;\n\n// Ollama configuration optimized for receipt extraction\nconst ollamaOptions = {\n  seed: 42,\n  temperature: 0.1,\n  top_k: 20,\n  top_p: 0.85,\n  num_predict: 32768,\n  num_ctx: 32800,\n  stop: []\n};\n\nreturn [{\n  json: {\n    jobId: receiptData.jobId,\n    receiptId: receiptData.receiptId,\n    filename: receiptData.filename,\n    base64Image: receiptData.base64Image,\n    base64SizeKB: receiptData.base64SizeKB,\n    systemPrompt: systemPrompt,\n    ollamaOptions: ollamaOptions,\n    model: receiptData.vlmModel,\n    promptVersion: \"9.0.0-multi-region-tax\",\n    readyForProcessing: true\n  }\n}];"
+      },
+      "id": "prepare-vlm-prompt",
+      "name": "Prepare VLM Prompt",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.VLM_API_URL || 'http://host.docker.internal:11434' }}/api/generate",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\n  \"model\": $json.model,\n  \"stream\": false,\n  \"format\": \"json\",\n  \"think\": false,\n  \"system\": $json.systemPrompt,\n  \"prompt\": \"Extract the receipt data following the instructions.\",\n  \"images\": [$json.base64Image],\n  \"options\": $json.ollamaOptions\n} }}",
+        "options": {
+          "timeout": 900000
+        }
+      },
+      "id": "extract-items-with-vlm",
+      "name": "Extract Items with VLM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Parse VLM Response\n * Extracts and validates JSON from VLM response, prepares items for database.\n *\n * Response Handling:\n * - Instruct models return JSON in 'response' field\n * - Thinking models may return in 'thinking' field\n * - Regex extraction handles cases where VLM adds explanatory text\n */\nconst promptData = $node['Prepare VLM Prompt'].json;\nconst vlmResponse = $json;\n\n// --- Configuration ---\nconst DEFAULT_CONFIDENCE = 0.5;\nconst MIN_RESPONSE_LENGTH = 10;\n\n// --- Extract Response Text ---\n// Different model types place output in different fields\nlet responseText = '';\nif (vlmResponse && vlmResponse.response) {\n  responseText = vlmResponse.response.trim();  // Instruct models\n} else if (vlmResponse && vlmResponse.thinking) {\n  responseText = vlmResponse.thinking.trim();  // Thinking models\n} else if (typeof vlmResponse === 'string') {\n  responseText = vlmResponse.trim();\n} else {\n  throw new Error('No response from VLM API');\n}\n\nif (!responseText || responseText.length < MIN_RESPONSE_LENGTH) {\n  throw new Error('VLM response is too short or empty');\n}\n\n// --- Extract JSON from Response ---\n// VLM may include explanatory text before/after JSON\n// This regex finds the outermost JSON object containing \"items\"\nconst JSON_EXTRACTION_PATTERN = /\\{[\\s\\S]*\"items\"[\\s\\S]*\\}/i;\nlet jsonMatch = responseText.match(JSON_EXTRACTION_PATTERN);\nlet jsonText = jsonMatch ? jsonMatch[0] : responseText;\n\n// --- Parse JSON ---\nlet extractedData;\ntry {\n  extractedData = JSON.parse(jsonText);\n} catch (e) {\n  throw new Error(`Failed to parse VLM JSON response: ${e.message}. Response: ${responseText.substring(0, 200)}`);\n}\n\n// --- Validate Structure ---\nif (!extractedData.items || !Array.isArray(extractedData.items)) {\n  throw new Error('VLM response missing items array');\n}\n\nconst items = extractedData.items;\nif (items.length === 0) {\n  throw new Error('No items extracted from receipt');\n}\n\n// --- Calculate Statistics ---\nconst totalItems = items.length;\nconst avgConfidence = items.reduce((sum, item) => sum + (item.confidence_score || DEFAULT_CONFIDENCE), 0) / totalItems;\n\n// --- Extract Receipt-Level Totals ---\nconst receiptTotals = {\n  currency: extractedData.currency || 'USD',\n  receipt_type: extractedData.receipt_type || 'unknown',\n  tax_format: extractedData.tax_format || 'none',\n  receipt_subtotal: extractedData.receipt_subtotal != null ? parseFloat(extractedData.receipt_subtotal) : null,\n  receipt_total_tax_amount: extractedData.receipt_total_tax_amount != null ? parseFloat(extractedData.receipt_total_tax_amount) : null,\n  receipt_total_tax_percentage: extractedData.receipt_total_tax_percentage != null ? parseFloat(extractedData.receipt_total_tax_percentage) : null,\n  receipt_total: extractedData.receipt_total != null ? parseFloat(extractedData.receipt_total) : null\n};\n\n// --- Prepare Items for Database ---\n// Normalize values, set defaults, add metadata\nconst validatedItems = items.map((item, index) => ({\n  receipt_id: promptData.receiptId,\n  item_name: item.item_name || 'Unknown Item',\n  item_quantity: item.item_quantity != null ? parseFloat(item.item_quantity) : 1,\n  item_unit_price: item.item_unit_price != null ? parseFloat(item.item_unit_price) : null,\n  item_base_price: parseFloat(item.item_base_price) || 0.00,\n  item_discount_amount: item.item_discount_amount != null ? parseFloat(item.item_discount_amount) : null,\n  item_discount_percentage: item.item_discount_percentage != null ? parseFloat(item.item_discount_percentage) : null,\n  item_tax_price: item.item_tax_price != null ? parseFloat(item.item_tax_price) : null,\n  item_tax_percentage: item.item_tax_percentage != null ? parseFloat(item.item_tax_percentage) : null,\n  item_total_price: parseFloat(item.item_total_price) || 0.00,\n  item_sequence: item.item_sequence || (index + 1),\n  item_type: item.item_type || 'standard',\n  confidence_score: parseFloat(item.confidence_score) || DEFAULT_CONFIDENCE,\n  item_metadata: {\n    extracted_at: new Date().toISOString(),\n    model: promptData.model,\n    prompt_version: promptData.promptVersion,\n    is_voided: item.item_metadata?.is_voided || false,\n    is_weight_based: item.item_metadata?.is_weight_based || false,\n    weight_unit: item.item_metadata?.weight_unit || null,\n    quantity_format: item.item_metadata?.quantity_format || null,\n    original_text: item.item_metadata?.original_text || null\n  }\n}));\n\nreturn [{\n  json: {\n    jobId: promptData.jobId,\n    receiptId: promptData.receiptId,\n    filename: promptData.filename,\n    items: validatedItems,\n    totalItems: totalItems,\n    avgConfidence: parseFloat(avgConfidence.toFixed(2)),\n    model: promptData.model,\n    rawVlmResponse: responseText.substring(0, 500),\n    extractionComplete: true,\n    ...receiptTotals\n  }\n}];"
+      },
+      "id": "parse-vlm-response",
+      "name": "Parse VLM Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        2120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE receipts SET items = '{{ JSON.stringify($node['Parse VLM Response'].json.items) }}'::jsonb, items_count = {{ $node['Parse VLM Response'].json.totalItems }}, total_confidence_score = {{ $node['Parse VLM Response'].json.avgConfidence }}, currency = '{{ $node['Parse VLM Response'].json.currency }}', receipt_type = '{{ $node['Parse VLM Response'].json.receipt_type }}', tax_format = '{{ $node['Parse VLM Response'].json.tax_format }}', receipt_subtotal = {{ $node['Parse VLM Response'].json.receipt_subtotal !== null ? $node['Parse VLM Response'].json.receipt_subtotal : 'NULL' }}, receipt_total_tax_amount = {{ $node['Parse VLM Response'].json.receipt_total_tax_amount !== null ? $node['Parse VLM Response'].json.receipt_total_tax_amount : 'NULL' }}, receipt_total_tax_percentage = {{ $node['Parse VLM Response'].json.receipt_total_tax_percentage !== null ? $node['Parse VLM Response'].json.receipt_total_tax_percentage : 'NULL' }}, receipt_total = {{ $node['Parse VLM Response'].json.receipt_total !== null ? $node['Parse VLM Response'].json.receipt_total : 'NULL' }}, processing_status = 'completed', updated_at = NOW() WHERE id = '{{ $node['Parse VLM Response'].json.receiptId }}'"
+      },
+      "id": "update-receipt-completion",
+      "name": "Update Receipt Completion",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2780,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=UPDATE receipt_processing_jobs SET status = 'completed', completed_at = NOW(), processing_duration_ms = EXTRACT(EPOCH FROM (NOW() - started_at)) * 1000, vlm_model_used = '{{ $node['Parse VLM Response'].json.model }}', extraction_metadata = jsonb_build_object('items_extracted', {{ $node['Parse VLM Response'].json.totalItems }}, 'avg_confidence', {{ $node['Parse VLM Response'].json.avgConfidence }}, 'completed_at', NOW()) WHERE id = '{{ $node['Parse VLM Response'].json.jobId }}'"
+      },
+      "id": "mark-job-completed",
+      "name": "Mark Job Completed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3000,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\n  status: 'success',\n  message: 'Receipt processed successfully',\n  jobId: $node['Parse VLM Response'].json.jobId,\n  receiptId: $node['Parse VLM Response'].json.receiptId,\n  itemsExtracted: $node['Parse VLM Response'].json.totalItems,\n  totalConfidence: $node['Parse VLM Response'].json.avgConfidence,\n  model: $node['Parse VLM Response'].json.model,\n  filename: $node['Parse VLM Response'].json.filename\n} }}",
+        "responseCode": 200
+      },
+      "id": "success-response",
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        3220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Prepare Error Response\n * Extracts error details from various possible error object shapes.\n * Logs details for debugging while returning sanitized response.\n */\nconst error = $input.first();\n\n// --- Extract Error Message ---\n// Error objects can have different shapes depending on source\nlet errorMessage = 'Unknown processing error';\nlet errorDetails = {};\n\nif (error) {\n  errorMessage = error.json?.error \n    || error.json?.message \n    || error.error?.message\n    || error.message \n    || JSON.stringify(error).substring(0, 500);\n  \n  // Capture details for debugging (not exposed to client)\n  errorDetails = {\n    errorType: error.name || 'Unknown',\n    errorStack: error.stack?.substring(0, 500) || 'No stack trace',\n    errorJson: error.json || {},\n    errorKeys: Object.keys(error)\n  };\n}\n\nconsole.error('[VLM Processor] Error:', errorMessage, errorDetails);\n\nreturn [{\n  json: {\n    status: 'error',\n    message: 'Receipt processing failed',\n    error: errorMessage,\n    details: errorDetails\n  }\n}];"
+      },
+      "id": "prepare-error-response",
+      "name": "Prepare Error Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1460,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "responseCode": 500
+      },
+      "id": "error-response",
+      "name": "Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1680,
+        500
+      ]
+    }
+  ],
+  "connections": {
+    "Process Receipt Webhook": {
+      "main": [
+        [
+          {
+            "node": "Configure VLM Model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Configure VLM Model": {
+      "main": [
+        [
+          {
+            "node": "Fetch Job Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Job Info": {
+      "main": [
+        [
+          {
+            "node": "Fetch Receipt Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Receipt Info": {
+      "main": [
+        [
+          {
+            "node": "Validate Receipt Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Receipt Data": {
+      "main": [
+        [
+          {
+            "node": "Read Receipt File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Prepare Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Receipt File": {
+      "main": [
+        [
+          {
+            "node": "Encode to Base64",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Encode to Base64": {
+      "main": [
+        [
+          {
+            "node": "Prepare VLM Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare VLM Prompt": {
+      "main": [
+        [
+          {
+            "node": "Extract Items with VLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Items with VLM": {
+      "main": [
+        [
+          {
+            "node": "Parse VLM Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse VLM Response": {
+      "main": [
+        [
+          {
+            "node": "Update Receipt Completion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Receipt Completion": {
+      "main": [
+        [
+          {
+            "node": "Mark Job Completed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Job Completed": {
+      "main": [
+        [
+          {
+            "node": "Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Error Response": {
+      "main": [
+        [
+          {
+            "node": "Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1"
+}

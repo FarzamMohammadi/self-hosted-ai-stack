@@ -1,0 +1,239 @@
+{
+  "name": "Receipt Export Generator",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "export-receipts",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "id": "export-receipts-webhook",
+      "name": "Export Receipts Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Parse Export Parameters\n * Extracts and validates filter parameters for the export request.\n * Defaults to 'completed' status to export only processed receipts.\n */\n\n// --- Configuration Constants ---\nconst VALID_STATUSES = ['pending', 'processing', 'completed', 'failed'];\nconst DEFAULT_EXPORT_STATUS = 'completed';\n\n// --- Extract Query Parameters ---\nconst query = $input.first().json.query || {};\n\n// Status filter - validate against whitelist\nconst status = query.status || DEFAULT_EXPORT_STATUS;\nif (status && !VALID_STATUSES.includes(status)) {\n  throw new Error(`Invalid status filter. Allowed values: ${VALID_STATUSES.join(', ')}`);\n}\n\n// Date range filters\nconst dateFrom = query.date_from || '';\nconst dateTo = query.date_to || '';\n\nreturn [{\n  json: {\n    filters: {\n      status: status,\n      dateFrom: dateFrom,\n      dateTo: dateTo\n    },\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "parse-export-params",
+      "name": "Parse Export Params",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 300],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Build Export Query\n * Constructs SQL to unnest JSONB items array and join with receipt metadata.\n * Uses LATERAL jsonb_array_elements() to create one row per item for CSV export.\n * Note: Status is pre-validated via whitelist in the previous node.\n */\nconst filters = $json.filters;\n\n// --- Sanitization Helper ---\nconst sanitizeString = (str, maxLength = 255) => {\n  if (typeof str !== 'string') return '';\n  return str.replace(/'/g, \"''\").substring(0, maxLength);\n};\n\n// --- Build WHERE Clauses ---\nconst whereClauses = [];\n\n// Status filter (already validated against whitelist)\nif (filters.status) {\n  whereClauses.push(`r.processing_status = '${filters.status}'`);\n}\n\n// Date range filters (cast to timestamp for proper comparison)\nif (filters.dateFrom) {\n  whereClauses.push(`r.created_at >= '${sanitizeString(filters.dateFrom)}'::timestamp`);\n}\nif (filters.dateTo) {\n  whereClauses.push(`r.created_at <= '${sanitizeString(filters.dateTo)}'::timestamp`);\n}\n\n// --- Build SQL Query ---\n// LATERAL jsonb_array_elements() unnests the items JSONB array,\n// creating one row per item joined with receipt metadata\nlet query = `\n  SELECT \n    r.id as receipt_id,\n    r.filename as receipt_filename,\n    r.created_at as receipt_date,\n    r.currency,\n    r.receipt_type,\n    r.tax_format,\n    r.receipt_subtotal,\n    r.receipt_total_tax_amount,\n    r.receipt_total_tax_percentage,\n    r.receipt_total,\n    (item->>'item_name')::text as item_name,\n    (item->>'item_quantity')::numeric as item_quantity,\n    (item->>'item_unit_price')::numeric as item_unit_price,\n    (item->>'item_base_price')::numeric as item_base_price,\n    (item->>'item_discount_amount')::numeric as item_discount_amount,\n    (item->>'item_discount_percentage')::numeric as item_discount_percentage,\n    (item->>'item_tax_price')::numeric as item_tax_price,\n    (item->>'item_tax_percentage')::numeric as item_tax_percentage,\n    (item->>'item_total_price')::numeric as item_total_price,\n    (item->>'item_sequence')::integer as item_sequence,\n    (item->>'confidence_score')::numeric as confidence_score\n  FROM receipts r,\n       LATERAL jsonb_array_elements(r.items) as item\n`;\n\nif (whereClauses.length > 0) {\n  query += ' WHERE ' + whereClauses.join(' AND ');\n}\n\n// Order by receipt date (newest first), then item sequence within each receipt\nquery += ' ORDER BY r.created_at DESC, item_sequence ASC';\n\nreturn [{\n  json: {\n    sqlQuery: query,\n    filters: filters,\n    timestamp: $json.timestamp\n  }\n}];"
+      },
+      "id": "build-export-query",
+      "name": "Build Export Query",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sqlQuery }}"
+      },
+      "id": "fetch-export-data",
+      "name": "Fetch Export Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [900, 300],
+      "credentials": {
+        "postgres": {
+          "id": "main_db",
+          "name": "main_db"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Generate CSV\n * Converts database query results into properly formatted CSV content.\n * Handles RFC 4180 CSV escaping (commas, quotes, newlines).\n */\n\n// --- Configuration Constants ---\nconst CSV_COLUMNS = [\n  'Receipt ID',\n  'Receipt Filename',\n  'Receipt Date',\n  'Currency',\n  'Receipt Type',\n  'Tax Format',\n  'Receipt Subtotal',\n  'Receipt Tax Amount',\n  'Receipt Tax %',\n  'Receipt Total',\n  'Item Name',\n  'Item Qty',\n  'Item Unit Price',\n  'Item Base Price',\n  'Item Discount',\n  'Item Discount %',\n  'Item Tax',\n  'Item Tax %',\n  'Item Total',\n  'Item Sequence',\n  'Confidence Score'\n];\nconst DECIMAL_PLACES = 2;\n\n// --- Helper Functions ---\n\n// RFC 4180 compliant CSV escaping\nfunction escapeCsvValue(value) {\n  if (value === null || value === undefined) return '';\n  const str = String(value);\n  // Wrap in quotes and escape internal quotes if value contains special chars\n  if (str.includes(',') || str.includes('\"') || str.includes('\\n')) {\n    return '\"' + str.replace(/\"/g, '\"\"') + '\"';\n  }\n  return str;\n}\n\n// Format numeric values with consistent decimal places\nfunction formatNumber(value) {\n  if (value === null || value === undefined) return '';\n  const num = parseFloat(value);\n  return isNaN(num) ? '' : num.toFixed(DECIMAL_PLACES);\n}\n\n// --- Build CSV ---\nconst items = $input.all().map(item => item.json);\nconst buildQueryData = $node['Build Export Query'].json;\n\n// Handle empty results - return headers only\nif (items.length === 0) {\n  return [{\n    json: {\n      csv: CSV_COLUMNS.join(','),\n      rowCount: 0,\n      timestamp: buildQueryData.timestamp\n    }\n  }];\n}\n\n// Build CSV content: header row + data rows\nconst csvRows = [CSV_COLUMNS.join(',')];\n\nitems.forEach(item => {\n  const row = [\n    escapeCsvValue(item.receipt_id),\n    escapeCsvValue(item.receipt_filename),\n    escapeCsvValue(item.receipt_date),\n    escapeCsvValue(item.currency),\n    escapeCsvValue(item.receipt_type),\n    escapeCsvValue(item.tax_format),\n    formatNumber(item.receipt_subtotal),\n    formatNumber(item.receipt_total_tax_amount),\n    formatNumber(item.receipt_total_tax_percentage),\n    formatNumber(item.receipt_total),\n    escapeCsvValue(item.item_name),\n    formatNumber(item.item_quantity),\n    formatNumber(item.item_unit_price),\n    formatNumber(item.item_base_price),\n    formatNumber(item.item_discount_amount),\n    formatNumber(item.item_discount_percentage),\n    formatNumber(item.item_tax_price),\n    formatNumber(item.item_tax_percentage),\n    formatNumber(item.item_total_price),\n    escapeCsvValue(item.item_sequence),\n    formatNumber(item.confidence_score)\n  ];\n  csvRows.push(row.join(','));\n});\n\nreturn [{\n  json: {\n    csv: csvRows.join('\\n'),\n    rowCount: items.length,\n    timestamp: buildQueryData.timestamp\n  }\n}];"
+      },
+      "id": "generate-csv",
+      "name": "Generate CSV",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Prepare Download\n * Generates timestamped filename for the CSV download.\n * Format: receipts_export_YYYY-MM-DD_HH-MM-SS.csv\n */\nconst date = new Date($json.timestamp);\n\n// Build filename with ISO-like timestamp (filesystem-safe characters)\nconst year = date.getFullYear();\nconst month = String(date.getMonth() + 1).padStart(2, '0');\nconst day = String(date.getDate()).padStart(2, '0');\nconst hours = String(date.getHours()).padStart(2, '0');\nconst minutes = String(date.getMinutes()).padStart(2, '0');\nconst seconds = String(date.getSeconds()).padStart(2, '0');\n\nconst filename = `receipts_export_${year}-${month}-${day}_${hours}-${minutes}-${seconds}.csv`;\n\nreturn [{\n  json: {\n    csv: $json.csv,\n    filename: filename,\n    rowCount: $json.rowCount\n  }\n}];"
+      },
+      "id": "prepare-download",
+      "name": "Prepare Download",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.csv }}",
+        "responseCode": 200,
+        "responseHeaders": {
+          "entries": [
+            {
+              "name": "Content-Type",
+              "value": "text/csv; charset=utf-8"
+            },
+            {
+              "name": "Content-Disposition",
+              "value": "={{ 'attachment; filename=\"' + $json.filename + '\"' }}"
+            },
+            {
+              "name": "Cache-Control",
+              "value": "no-cache, no-store, must-revalidate"
+            }
+          ]
+        }
+      },
+      "id": "success-response",
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "/**\n * Prepare Error Response\n * Formats error information for the API response.\n * Status codes: 400 (validation error), 500 (server error)\n */\nconst error = $input.first();\n\nlet errorMessage = 'Failed to generate export';\nlet statusCode = 500;\n\nif (error && error.json) {\n  const errMsg = error.json.error || error.json.message || '';\n  \n  // Check for validation errors (return 400 Bad Request)\n  if (errMsg.includes('Invalid status filter')) {\n    statusCode = 400;\n    errorMessage = errMsg;\n  } else {\n    errorMessage = errMsg || errorMessage;\n  }\n}\n\nconsole.error('[Receipt Export Generator] Error:', errorMessage);\n\nreturn [{\n  json: {\n    status: 'error',\n    message: errorMessage,\n    statusCode: statusCode\n  }\n}];"
+      },
+      "id": "prepare-error-response",
+      "name": "Prepare Error Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: $json.status, message: $json.message } }}",
+        "responseCode": "={{ $json.statusCode || 500 }}",
+        "responseHeaders": {
+          "entries": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      },
+      "id": "error-response",
+      "name": "Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1120, 500]
+    }
+  ],
+  "connections": {
+    "Export Receipts Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse Export Params",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Export Params": {
+      "main": [
+        [
+          {
+            "node": "Build Export Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Prepare Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Export Query": {
+      "main": [
+        [
+          {
+            "node": "Fetch Export Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Export Data": {
+      "main": [
+        [
+          {
+            "node": "Generate CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ],
+      "error": [
+        [
+          {
+            "node": "Prepare Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate CSV": {
+      "main": [
+        [
+          {
+            "node": "Prepare Download",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Download": {
+      "main": [
+        [
+          {
+            "node": "Success Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Error Response": {
+      "main": [
+        [
+          {
+            "node": "Error Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1"
+}

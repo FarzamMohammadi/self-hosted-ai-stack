@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Receipts - Receipt Manager</title>
+    <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body>
+    <header class="header">
+        <div class="header-content">
+            <h1><a href="/index.html" class="header-link">Receipt Manager</a></h1>
+            <nav class="nav">
+                <a href="/index.html" class="btn btn-secondary">Upload Receipt</a>
+                <button id="exportBtn" class="btn btn-success">
+                    <span>&#128229;</span>
+                    <span>Export CSV</span>
+                </button>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container">
+        <!-- Alert Messages -->
+        <div id="alertContainer" role="alert" aria-live="polite"></div>
+
+        <!-- Filters -->
+        <div class="filters">
+            <div class="filter-group">
+                <label class="form-label" for="statusFilter">Status</label>
+                <select id="statusFilter" class="form-select">
+                    <option value="">All Statuses</option>
+                    <option value="pending">Pending</option>
+                    <option value="processing">Processing</option>
+                    <option value="completed">Completed</option>
+                    <option value="failed">Failed</option>
+                </select>
+            </div>
+
+            <div class="filter-group">
+                <label class="form-label" for="dateFilter">Date Range</label>
+                <select id="dateFilter" class="form-select">
+                    <option value="">All Time</option>
+                    <option value="today">Today</option>
+                    <option value="7days">Last 7 Days</option>
+                    <option value="30days">Last 30 Days</option>
+                    <option value="custom">Custom Range</option>
+                </select>
+            </div>
+
+            <div class="filter-group">
+                <label class="form-label" for="searchFilter">Search Filename</label>
+                <input type="text" id="searchFilter" class="form-input" placeholder="Search by filename...">
+            </div>
+
+            <div class="filter-group filter-controls">
+                <button id="refreshBtn" class="btn btn-primary" style="flex: 1;">
+                    <span id="refreshIcon">&#128260;</span>
+                    <span>Refresh</span>
+                </button>
+                <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; white-space: nowrap;">
+                    <input type="checkbox" id="autoRefreshToggle" style="width: auto;">
+                    <span>Auto (10s)</span>
+                </label>
+            </div>
+        </div>
+
+        <!-- Custom Date Range (hidden by default) -->
+        <div id="customDateRange" class="filters hidden" style="margin-top: -1rem;">
+            <div class="filter-group">
+                <label class="form-label" for="dateFrom">From</label>
+                <input type="date" id="dateFrom" class="form-input">
+            </div>
+            <div class="filter-group">
+                <label class="form-label" for="dateTo">To</label>
+                <input type="date" id="dateTo" class="form-input">
+            </div>
+        </div>
+
+        <!-- Receipts Table -->
+        <div class="card">
+            <div class="card-header card-header-flex">
+                <h2 class="card-title" style="margin: 0;">Receipts</h2>
+                <span id="receiptsCount" class="text-sm" style="color: var(--text-secondary);">Loading...</span>
+            </div>
+
+            <!-- Loading State -->
+            <div id="loadingState" class="loading-container">
+                <div class="loading loading-lg"></div>
+                <p class="loading-text">Loading receipts...</p>
+            </div>
+
+            <!-- Empty State -->
+            <div id="emptyState" class="empty-state hidden">
+                <div class="empty-state-icon">&#128196;</div>
+                <p class="empty-state-text">No receipts found</p>
+                <p class="empty-state-hint">Upload your first receipt to get started</p>
+                <a href="/index.html" class="btn btn-primary" style="margin-top: 1rem;">Upload Receipt</a>
+            </div>
+
+            <!-- Receipts Table -->
+            <div id="tableContainer" class="table-container hidden">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th scope="col">Image</th>
+                            <th scope="col" class="sortable" data-sort="filename">Filename</th>
+                            <th scope="col" class="sortable" data-sort="created_at">Upload Date</th>
+                            <th scope="col" class="sortable" data-sort="processing_status">Status</th>
+                            <th scope="col" class="sortable" data-sort="items_count">Items</th>
+                            <th scope="col" class="sortable" data-sort="total_confidence_score">Confidence</th>
+                        </tr>
+                    </thead>
+                    <tbody id="receiptsTableBody">
+                        <!-- Populated by JavaScript -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </main>
+
+    <!-- Detail Modal -->
+    <div id="detailModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 class="modal-title" id="modalTitle">Receipt Details</h2>
+                <button class="modal-close" id="closeModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <!-- Loading State -->
+                <div id="modalLoading" class="loading-container">
+                    <div class="loading loading-lg"></div>
+                    <p class="loading-text">Loading receipt details...</p>
+                </div>
+
+                <!-- Receipt Detail Content -->
+                <div id="modalContent" class="hidden">
+                    <div class="receipt-detail">
+                        <!-- Left Column: Image -->
+                        <div class="receipt-image-container">
+                            <div class="receipt-image-wrapper">
+                                <img id="receiptImage" class="receipt-image" src="" alt="Receipt" loading="lazy">
+                            </div>
+                            <div class="receipt-image-actions">
+                                <button id="zoomBtn" class="btn btn-secondary btn-sm">Zoom In</button>
+                                <a id="downloadBtn" href="" download class="btn btn-secondary btn-sm">Download</a>
+                            </div>
+                        </div>
+
+                        <!-- Right Column: Metadata & Items -->
+                        <div class="receipt-detail-sidebar">
+                            <!-- Metadata -->
+                            <div class="receipt-metadata">
+                                <h3>Receipt Information</h3>
+                                <div class="metadata-row">
+                                    <span class="metadata-label">Filename:</span>
+                                    <span class="metadata-value" id="detailFilename">-</span>
+                                </div>
+                                <div class="metadata-row">
+                                    <span class="metadata-label">Upload Date:</span>
+                                    <span class="metadata-value" id="detailDate">-</span>
+                                </div>
+                                <div class="metadata-row">
+                                    <span class="metadata-label">File Size:</span>
+                                    <span class="metadata-value" id="detailSize">-</span>
+                                </div>
+                                <div class="metadata-row">
+                                    <span class="metadata-label">Status:</span>
+                                    <span class="metadata-value" id="detailStatus">-</span>
+                                </div>
+                                <div class="metadata-row">
+                                    <span class="metadata-label">Currency:</span>
+                                    <span class="metadata-value" id="detailCurrency">-</span>
+                                </div>
+                                <div class="metadata-row">
+                                    <span class="metadata-label">Receipt Type:</span>
+                                    <span class="metadata-value" id="detailReceiptType">-</span>
+                                </div>
+                                <div class="metadata-row">
+                                    <span class="metadata-label">Tax Format:</span>
+                                    <span class="metadata-value" id="detailTaxFormat">-</span>
+                                </div>
+                                <div class="metadata-row">
+                                    <span class="metadata-label">Items Count:</span>
+                                    <span class="metadata-value" id="detailItemsCount">-</span>
+                                </div>
+                                <div class="metadata-row">
+                                    <span class="metadata-label">Avg Confidence:</span>
+                                    <span class="metadata-value" id="detailConfidence">-</span>
+                                </div>
+                            </div>
+
+                            <!-- Items Table -->
+                            <div class="items-table">
+                                <h3>Extracted Items</h3>
+
+                                <!-- No items state -->
+                                <div id="noItems" class="hidden empty-state-hint">
+                                    <p>No items extracted yet</p>
+                                    <p>Processing may still be in progress</p>
+                                </div>
+
+                                <!-- Items table -->
+                                <div id="itemsTableContainer" class="hidden">
+                                    <div class="table-container">
+                                        <table class="table">
+                                            <thead>
+                                                <tr>
+                                                    <th scope="col">#</th>
+                                                    <th scope="col">Item Name</th>
+                                                    <th scope="col">Qty</th>
+                                                    <th scope="col">Unit Price</th>
+                                                    <th scope="col">Tax</th>
+                                                    <th scope="col">Total</th>
+                                                    <th scope="col">Confidence</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody id="itemsTableBody">
+                                                <!-- Populated by JavaScript -->
+                                            </tbody>
+                                            <tfoot>
+                                                <tr class="table-subtotal-row">
+                                                    <td colspan="5">Subtotal</td>
+                                                    <td class="price" id="receiptSubtotal">-</td>
+                                                    <td></td>
+                                                </tr>
+                                                <tr class="table-tax-row">
+                                                    <td colspan="5">Tax (<span id="taxPercentage">-</span>)</td>
+                                                    <td class="price" id="receiptTaxAmount">-</td>
+                                                    <td></td>
+                                                </tr>
+                                                <tr class="table-total-row">
+                                                    <td colspan="5">TOTAL</td>
+                                                    <td class="price" id="receiptTotal">-</td>
+                                                    <td></td>
+                                                </tr>
+                                            </tfoot>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Image Lightbox -->
+    <div id="imageLightbox" class="lightbox">
+        <div class="lightbox-content">
+            <img id="lightboxImage" src="" alt="Receipt">
+        </div>
+        <div class="lightbox-controls">
+            <button id="lightboxZoomOut" class="lightbox-btn" title="Zoom Out">−</button>
+            <span id="lightboxZoomLevel">100%</span>
+            <button id="lightboxZoomIn" class="lightbox-btn" title="Zoom In">+</button>
+            <button id="lightboxReset" class="lightbox-btn" title="Reset">Reset</button>
+            <button id="lightboxClose" class="lightbox-btn lightbox-close" title="Close (Esc)">×</button>
+        </div>
+        <div class="lightbox-hint">Scroll to zoom • Drag to pan • Esc to close</div>
+    </div>
+
+    <script src="/js/app.js"></script>
+    <script src="/js/receipts.js"></script>
+</body>
+</html>
