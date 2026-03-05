@@ -56,7 +56,7 @@ services:
 
       # Basic settings
       - WEBUI_SECRET_KEY=your-secret-key-here
-      - WEBUI_AUTH=true
+      - WEBUI_AUTH=false
       - ENABLE_SIGNUP=true
       - DEFAULT_MODELS=qwen3:8b
 
